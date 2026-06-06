@@ -61,7 +61,6 @@ def clarke_zone(pred: float) -> str:
 def run_pipeline(
     ir_raw : list,
     red_raw: list,
-    hr_avg : float,
     fs     : int   = 100,
 ) -> dict:
     """
@@ -152,7 +151,7 @@ def run_pipeline(
 
         # Metadata — only hr_avg and age used by model
         # height and weight set to 0 (excluded from GA features)
-        feat["meta_hr_avg"] = hr_avg
+        feat["meta_hr_avg"] = 0.0
         feat["meta_age"]    = 0.0    # age not used by model
         feat["meta_height"] = 0.0    # not used by model
         feat["meta_weight"] = 0.0    # not used by model

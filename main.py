@@ -35,8 +35,8 @@ class PPGRequest(BaseModel):
                 description="IR channel samples (5000 for 50s @ 100Hz)")
     red    : List[float] = Field(...,
                 description="Red channel samples (5000 for 50s @ 100Hz)")
-    hr_avg : float       = Field(...,
-                description="Average heart rate in bpm from HR_Valid samples")
+    # hr_avg : float       = Field(...,
+    #             description="Average heart rate in bpm from HR_Valid samples")
     # age    : Optional[float] = Field(0.0,
     #             description="Patient age in years (optional)")
     # height and weight removed — excluded from GA-selected features
@@ -129,7 +129,7 @@ def predict(req: PPGRequest):
         result = run_pipeline(
             ir_raw = req.ir,
             red_raw= req.red,
-            hr_avg = req.hr_avg,
+            # hr_avg = req.hr_avg,
             age    = req.age or 0.0,
         )
         return PPGResponse(**result)
