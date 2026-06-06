@@ -37,8 +37,8 @@ class PPGRequest(BaseModel):
                 description="Red channel samples (5000 for 50s @ 100Hz)")
     hr_avg : float       = Field(...,
                 description="Average heart rate in bpm from HR_Valid samples")
-    age    : Optional[float] = Field(0.0,
-                description="Patient age in years (optional)")
+    # age    : Optional[float] = Field(0.0,
+    #             description="Patient age in years (optional)")
     # height and weight removed — excluded from GA-selected features
 
 class PPGResponse(BaseModel):
