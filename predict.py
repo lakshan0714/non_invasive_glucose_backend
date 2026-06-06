@@ -1,118 +1,80 @@
 """
-predict.py
-──────────
-Full inference pipeline:
-  raw IR/Red arrays
-    → bandpass filter + baseline correction
-    → segment (10s windows)
-    → skip first 2 + last segment
-    → SQC check per segment
-    → extract Group A + C + D features
-    → select GA-identified features (height/weight excluded)
-    → SVR predict per segment
-    → average → return result
+predict.py — with full logging
 """
 
 import numpy as np
-import pickle
-import os
+import pickle, os, logging, time
 
 from signal_processing  import full_filter, segment_signal, check_sqc
 from feature_extraction import (extract_group_A, extract_group_C,
                                  extract_group_D, get_full_feat_names)
 
-# ── Load model once at startup ────────────────────────────────────────────────
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "model", "svr_final_model.pkl")
+logger     = logging.getLogger("glucose_api")
+MODEL_PATH = os.path.join(os.path.dirname(__file__),
+                          "model", "svr_final_model.pkl")
 
 _model_pkg  = None
 _full_names = None
 
 
 def _load_model():
-    """Load model pickle once and cache it."""
     global _model_pkg, _full_names
     if _model_pkg is None:
+        logger.info(f"Loading model from {MODEL_PATH}")
         with open(MODEL_PATH, "rb") as f:
             _model_pkg = pickle.load(f)
         _full_names = get_full_feat_names()
-        print(f"[predict] Model loaded")
-        print(f"  Features  : {len(_model_pkg['feature_names'])}")
-        print(f"  Kernel    : {_model_pkg.get('kernel', 'rbf')}")
-        print(f"  C         : {_model_pkg.get('C', 10)}")
-        print(f"  LOPO RMSE : {_model_pkg.get('lopo_rmse', 'N/A')}")
+        logger.info(f"Model loaded — "
+                    f"type={_model_pkg.get('model_type','SVR')} "
+                    f"features={len(_model_pkg['feature_names'])} "
+                    f"kernel={_model_pkg.get('kernel','rbf')} "
+                    f"C={_model_pkg.get('C',10)}")
     return _model_pkg, _full_names
 
 
 def clarke_zone(pred: float) -> str:
-    """
-    Classify glucose level into clinical category.
-    (No reference glucose available from device)
-    """
-    if pred < 70:
-        return "Low (Hypoglycemic)"
-    elif pred < 100:
-        return "Normal"
-    elif pred < 126:
-        return "Pre-diabetic"
-    else:
-        return "Diabetic"
+    if pred < 70:    return "Low (Hypoglycemic)"
+    elif pred < 100: return "Normal"
+    elif pred < 126: return "Pre-diabetic"
+    else:            return "Diabetic"
 
 
-def run_pipeline(
-    ir_raw : list,
-    red_raw: list,
-    fs     : int   = 100,
-) -> dict:
-    """
-    Full inference pipeline — raw signal to glucose prediction.
+def run_pipeline(ir_raw, red_raw, age=0.0, fs=100) -> dict:
 
-    Parameters
-    ----------
-    ir_raw  : Raw IR channel samples (list of ints/floats)
-    red_raw : Raw Red channel samples
-    hr_avg  : Average heart rate (bpm) computed from HR_Valid samples
-    age     : Patient age in years (optional — set 0 if unknown)
-    fs      : Sampling frequency Hz (default 100)
-
-    Returns
-    -------
-    dict with keys:
-        status, glucose, zone, std, n_segments_used,
-        seg_predictions, total_segments,
-        skipped_sqc, skipped_cycle, signal_duration_s
-    """
     pkg, full_names = _load_model()
     model      = pkg["model"]
     scaler     = pkg["scaler"]
-    feat_names = pkg["feature_names"]   # GA-selected feature names
+    feat_names = pkg["feature_names"]
 
     ir  = np.array(ir_raw,  dtype=np.float64)
     red = np.array(red_raw, dtype=np.float64)
 
-    # ── Validate ──────────────────────────────────────────────────────────────
-    if len(ir) < fs * 10:
-        return {
-            "status" : "error",
-            "message": f"Signal too short: {len(ir)} samples, "
-                       f"need >= {fs * 10} (10 seconds minimum)",
-        }
+    logger.info(f"Signal received — IR:{len(ir)} "
+                f"Red:{len(red)} duration:{len(ir)/fs:.1f}s")
 
-    # ── Step 1: Filter ────────────────────────────────────────────────────────
+    if len(ir) < fs * 10:
+        logger.warning(f"Signal too short: {len(ir)} samples")
+        return {"status":"error",
+                "message":f"Signal too short: {len(ir)} samples"}
+
+    # ── Filter ────────────────────────────────────────────────────
+    logger.info("Applying bandpass filter + baseline correction...")
+    t0    = time.time()
     ir_f  = full_filter(ir,  fs)
     red_f = full_filter(red, fs)
+    logger.info(f"Filtering done in {time.time()-t0:.2f}s")
 
-    # ── Step 2: Segment ───────────────────────────────────────────────────────
+    # ── Segment ───────────────────────────────────────────────────
     segs       = segment_signal(ir_f, red_f, fs=fs)
     total_segs = len(segs)
+    logger.info(f"Segmented into {total_segs} segments")
 
     if total_segs < 4:
-        return {
-            "status" : "error",
-            "message": f"Too few segments: {total_segs}. "
-                       f"Need >= 4 (signal needs to be at least 40 seconds)",
-        }
+        logger.warning(f"Too few segments: {total_segs}")
+        return {"status":"error",
+                "message":f"Too few segments: {total_segs}, need >=4"}
 
-    # ── Step 3: Extract features (skip first 2 + last segment) ───────────────
+    # ── Extract features ──────────────────────────────────────────
     valid_feats   = []
     skipped_sqc   = 0
     skipped_cycle = 0
@@ -120,79 +82,77 @@ def run_pipeline(
     for seg in segs:
         sid = seg["seg_id"]
 
-        # Skip first 2 segments — sensor settling artifacts
         if sid < 2:
+            logger.info(f"Seg {sid} skipped (first 2 settling)")
             continue
-
-        # Skip last segment — signal end artifacts
         if sid == total_segs - 1:
+            logger.info(f"Seg {sid} skipped (last segment)")
             continue
 
-        # Signal quality check
         if not check_sqc(seg, fs):
             skipped_sqc += 1
+            logger.info(f"Seg {sid} failed SQC")
             continue
 
-        # Extract Group A — morphological + FFT
         fA_ir  = extract_group_A(seg, "ir",  fs)
         fA_red = extract_group_A(seg, "red", fs)
         if fA_ir is None or fA_red is None:
             skipped_cycle += 1
+            logger.info(f"Seg {sid} failed cycle extraction")
             continue
 
-        # Build feature dict
         feat = {}
         feat.update(fA_ir)
         feat.update(fA_red)
-        feat.update(extract_group_C(seg, "ir",  fs))   # MFCC
+        feat.update(extract_group_C(seg, "ir",  fs))
         feat.update(extract_group_C(seg, "red", fs))
-        feat.update(extract_group_D(seg, "ir",  fs))   # Statistical
+        feat.update(extract_group_D(seg, "ir",  fs))
         feat.update(extract_group_D(seg, "red", fs))
-
-        # Metadata — only hr_avg and age used by model
-        # height and weight set to 0 (excluded from GA features)
         feat["meta_hr_avg"] = 0.0
-        feat["meta_age"]    = 0.0    # age not used by model
-        feat["meta_height"] = 0.0    # not used by model
-        feat["meta_weight"] = 0.0    # not used by model
+        feat["meta_age"]    = age
+        feat["meta_height"] = 0.0
+        feat["meta_weight"] = 0.0
 
-        # Build full feature vector (must match training order)
-        vec = np.array(
-            [feat.get(n, np.nan) for n in full_names],
-            dtype=np.float32
-        )
+        vec = np.array([feat.get(n, np.nan) for n in full_names],
+                       dtype=np.float32)
         valid_feats.append(vec)
+        logger.info(f"Seg {sid} features extracted OK")
 
-    # ── Check valid segments ───────────────────────────────────────────────────
+    logger.info(f"Valid segments: {len(valid_feats)} | "
+                f"skipped_sqc: {skipped_sqc} | "
+                f"skipped_cycle: {skipped_cycle}")
+
     if not valid_feats:
+        logger.error("No valid segments after all checks!")
         return {
             "status" : "error",
-            "message": (
-                f"No valid segments after quality check. "
-                f"Total={total_segs}, "
-                f"skipped_sqc={skipped_sqc}, "
-                f"skipped_cycle={skipped_cycle}. "
-                f"Check signal quality and finger placement."
-            ),
+            "message": (f"No valid segments. "
+                        f"total={total_segs} "
+                        f"skipped_sqc={skipped_sqc} "
+                        f"skipped_cycle={skipped_cycle}"),
         }
 
-    # ── Step 4: Select GA features ────────────────────────────────────────────
+    # ── Select GA features ────────────────────────────────────────
+    logger.info(f"Selecting {len(feat_names)} GA features...")
     X_all = np.nan_to_num(np.array(valid_feats), nan=0.0)
-
-    # Select only GA-identified features in correct order
     X_sel = np.array([
         [row[full_names.index(n)] for n in feat_names]
         for row in X_all
     ], dtype=np.float32)
+    logger.info(f"Feature matrix shape: {X_sel.shape}")
 
-    # ── Step 5: Scale + predict ───────────────────────────────────────────────
+    # ── Scale + predict ───────────────────────────────────────────
+    logger.info("Scaling and predicting...")
     X_sc      = scaler.transform(X_sel)
     seg_preds = model.predict(X_sc).tolist()
+    glucose   = float(np.mean(seg_preds))
+    std       = float(np.std(seg_preds))
+    zone      = clarke_zone(glucose)
 
-    # ── Step 6: Average predictions ───────────────────────────────────────────
-    glucose = float(np.mean(seg_preds))
-    std     = float(np.std(seg_preds))
-    zone    = clarke_zone(glucose)
+    logger.info(f"Prediction: glucose={glucose:.2f} "
+                f"zone={zone} std={std:.2f} "
+                f"segments={len(seg_preds)} "
+                f"preds={[round(p,2) for p in seg_preds]}")
 
     return {
         "status"           : "success",
