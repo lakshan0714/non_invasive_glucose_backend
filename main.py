@@ -4,6 +4,8 @@ main.py — with full request/response logging
 
 from fastapi                  import FastAPI, HTTPException, Request
 from fastapi.middleware.cors  import CORSMiddleware
+from fastapi.exceptions       import RequestValidationError
+from fastapi.responses        import JSONResponse
 from pydantic                 import BaseModel, Field
 from typing                   import List, Optional
 import os, time, logging, uvicorn
@@ -42,6 +44,25 @@ async def log_requests(request: Request, call_next):
                 f"status={response.status_code} "
                 f"time={elapsed:.2f}s")
     return response
+
+# ── Validation error logging ───────────────────────────────────────
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    body = exc.body
+    if isinstance(body, (bytes, bytearray)):
+        body_str = body.decode("utf-8", errors="replace")
+    else:
+        body_str = str(body)
+
+    logger.error(f"422 Validation error on {request.url.path}: {exc.errors()}")
+    logger.error(f"Body length: {len(body_str)} chars")
+    logger.error(f"Body head: {body_str[:300]}")
+    logger.error(f"Body tail: {body_str[-300:]}")
+
+    return JSONResponse(
+        status_code=422,
+        content={"status": "error", "message": "Validation failed", "errors": exc.errors()},
+    )
 
 # ── Schemas ───────────────────────────────────────────────────────
 class PPGRequest(BaseModel):
