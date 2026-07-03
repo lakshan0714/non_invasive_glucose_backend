@@ -49,8 +49,8 @@ class PPGRequest(BaseModel):
             description="IR channel samples")
     red : List[float] = Field(...,
             description="Red channel samples")
-    age : Optional[float] = Field(0.0,
-            description="Patient age (optional)")
+    # age : Optional[float] = Field(0.0,
+    #         description="Patient age (optional)")
 
 class PPGResponse(BaseModel):
     status            : str
