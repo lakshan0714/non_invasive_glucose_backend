@@ -29,6 +29,7 @@
 #include <ArduinoJson.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_GFX.h>
+#include <esp_heap_caps.h>
 
 // ── WiFi credentials ──────────────────────────────────────────────
 const char* WIFI_SSID     = "chiki chiki";       // ← change
@@ -92,6 +93,11 @@ int   smoothIndex = 0;
 float* irBuffer  = nullptr;
 float* redBuffer = nullptr;
 int    sampleCount = 0;
+
+// ── JSON payload buffer (built once at boot, reused every send) ──
+// Worst case per float: "-262143.1234," = 14 bytes. 2 arrays * TOTAL_SAMPLES.
+const size_t PAYLOAD_BUF_SIZE = (size_t)TOTAL_SAMPLES * 2 * 14 + 256;
+char*  payloadBuf = nullptr;
 
 // ── State machine ─────────────────────────────────────────────────
 enum State {
@@ -424,6 +430,30 @@ void setup() {
     while (true);
   }
 
+  // Allocate JSON payload buffer ONCE, here, while heap is least
+  // fragmented. Prefer PSRAM if the board has it; fall back to
+  // internal heap otherwise. Building this buffer with repeated
+  // Arduino String concatenation instead (as before) caused heap
+  // fragmentation/OOM mid-request, which silently emptied the String
+  // and sent an empty POST body (server saw 422 "Field required").
+  Serial.printf("Free heap before payload buffer alloc: %u bytes\n", ESP.getFreeHeap());
+  Serial.printf("Requesting payload buffer: %u bytes\n", (unsigned)PAYLOAD_BUF_SIZE);
+
+  payloadBuf = (char*) heap_caps_malloc(PAYLOAD_BUF_SIZE, MALLOC_CAP_SPIRAM);
+  if (payloadBuf) {
+    Serial.println("Payload buffer allocated in PSRAM");
+  } else {
+    payloadBuf = (char*) malloc(PAYLOAD_BUF_SIZE);
+    if (payloadBuf) Serial.println("Payload buffer allocated in internal heap");
+  }
+
+  if (!payloadBuf) {
+    Serial.println("Payload buffer allocation failed!");
+    showError("Memory error!\nRestart device");
+    while (true);
+  }
+  Serial.printf("Free heap after payload buffer alloc: %u bytes\n", ESP.getFreeHeap());
+
   // Init smoothing arrays
   for (int i = 0; i < SMOOTH_SIZE; i++) {
     irSmooth[i] = 0;
@@ -587,37 +617,55 @@ void loop() {
     http.addHeader("Content-Type", "application/json");
     http.setTimeout(120000);   // 2 min timeout
 
-    // ── Build JSON ──────────────────────────────────────────────
-    String payload = "{";
-    payload.reserve(TOTAL_SAMPLES * 10 + 200);
+    // ── Build JSON into the pre-allocated buffer ─────────────────
+    // Writing directly into one fixed buffer (instead of growing an
+    // Arduino String via repeated +=) avoids the heap fragmentation/OOM
+    // that was silently truncating the payload to empty.
+    Serial.printf("Free heap before JSON build: %u bytes\n", ESP.getFreeHeap());
 
-    payload += "\"age\":" + String(PATIENT_AGE, 1) + ",";
+    size_t pos = 0;
+    size_t cap = PAYLOAD_BUF_SIZE;
+    bool   overflow = false;
 
-    // IR array
-    payload += "\"ir\":[";
-    for (int i = 0; i < TOTAL_SAMPLES; i++) {
-      payload += String(irBuffer[i], 4);
-      if (i < TOTAL_SAMPLES - 1) payload += ",";
+    #define APPEND(...) do { \
+      int _n = snprintf(payloadBuf + pos, cap - pos, __VA_ARGS__); \
+      if (_n < 0 || (size_t)_n >= cap - pos) { overflow = true; } \
+      else { pos += (size_t)_n; } \
+    } while (0)
+
+    APPEND("{\"age\":%.1f,\"ir\":[", PATIENT_AGE);
+
+    for (int i = 0; i < TOTAL_SAMPLES && !overflow; i++) {
+      APPEND(i < TOTAL_SAMPLES - 1 ? "%.4f," : "%.4f", irBuffer[i]);
       if (i % 500 == 0) {
         yield();
         Serial.printf("Building JSON IR: %d/%d\n", i, TOTAL_SAMPLES);
       }
     }
-    payload += "],";
+    if (!overflow) APPEND("],\"red\":[");
 
-    // Red array
-    payload += "\"red\":[";
-    for (int i = 0; i < TOTAL_SAMPLES; i++) {
-      payload += String(redBuffer[i], 4);
-      if (i < TOTAL_SAMPLES - 1) payload += ",";
+    for (int i = 0; i < TOTAL_SAMPLES && !overflow; i++) {
+      APPEND(i < TOTAL_SAMPLES - 1 ? "%.4f," : "%.4f", redBuffer[i]);
       if (i % 500 == 0) yield();
     }
-    payload += "]}";
+    if (!overflow) APPEND("]}");
 
-    Serial.printf("Payload size: %d bytes\n", payload.length());
+    #undef APPEND
+
+    if (overflow) {
+      Serial.println("Payload buffer overflow — aborting send!");
+      showError("Payload too\nlarge, restart");
+      delay(5000);
+      showIdle();
+      currentState = STATE_IDLE;
+      return;
+    }
+
+    Serial.printf("Payload size: %u bytes\n", (unsigned)pos);
+    Serial.printf("Free heap after JSON build: %u bytes\n", ESP.getFreeHeap());
 
     // ── POST request ────────────────────────────────────────────
-    int httpCode = http.POST(payload);
+    int httpCode = http.POST((uint8_t*)payloadBuf, pos);
     Serial.printf("HTTP code: %d\n", httpCode);
 
     if (httpCode == 200) {
