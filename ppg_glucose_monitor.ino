@@ -481,20 +481,65 @@ bool sendPredictRequest(int &httpCode, String &responseBody) {
   int sp1  = statusLine.indexOf(' ');
   httpCode = (sp1 >= 0) ? statusLine.substring(sp1 + 1, sp1 + 4).toInt() : 0;
 
-  // Skip response headers up to the blank line
+  // Read response headers, capturing Content-Length / chunked so we
+  // know exactly how many body bytes to expect — relying on the
+  // socket closing (as the old code did) can hang for a long time if
+  // Render's proxy keeps the connection open, and silently corrupts
+  // the JSON if the response is chunked instead of a flat body.
+  long contentLenResp = -1;
+  bool chunked = false;
   while (client.connected() || client.available()) {
     String line = client.readStringUntil('\n');
     if (line.length() <= 1) break;   // bare "\r" == end of headers
-  }
-
-  // Read response body
-  responseBody = "";
-  while (client.connected() || client.available()) {
-    while (client.available()) {
-      responseBody += (char)client.read();
+    line.trim();
+    String lower = line;
+    lower.toLowerCase();
+    if (lower.startsWith("content-length:")) {
+      contentLenResp = line.substring(line.indexOf(':') + 1).toInt();
+    } else if (lower.startsWith("transfer-encoding:") && lower.indexOf("chunked") >= 0) {
+      chunked = true;
     }
   }
+
+  responseBody = "";
+  unsigned long readDeadline = millis() + 20000UL;   // 20s to read the (small) body
+
+  if (chunked) {
+    while (millis() < readDeadline) {
+      while (!client.available() && client.connected() && millis() < readDeadline) delay(5);
+      String sizeLine = client.readStringUntil('\n');
+      sizeLine.trim();
+      long chunkSize = strtol(sizeLine.c_str(), nullptr, 16);
+      if (chunkSize <= 0) break;   // terminating 0-size chunk
+      long got = 0;
+      while (got < chunkSize && millis() < readDeadline) {
+        while (!client.available() && client.connected() && millis() < readDeadline) delay(5);
+        while (client.available() && got < chunkSize) {
+          responseBody += (char)client.read();
+          got++;
+        }
+      }
+      client.readStringUntil('\n');   // consume the CRLF after chunk data
+    }
+  } else if (contentLenResp >= 0) {
+    long got = 0;
+    while (got < contentLenResp && millis() < readDeadline) {
+      while (!client.available() && client.connected() && millis() < readDeadline) delay(5);
+      while (client.available() && got < contentLenResp) {
+        responseBody += (char)client.read();
+        got++;
+      }
+    }
+  } else {
+    // No length info at all — fall back to reading until close,
+    // but still bounded by the deadline so we can't hang forever.
+    while ((client.connected() || client.available()) && millis() < readDeadline) {
+      while (client.available()) responseBody += (char)client.read();
+    }
+  }
+
   client.stop();
+  Serial.printf("Response body read: %u bytes\n", responseBody.length());
 
   return true;
 }
