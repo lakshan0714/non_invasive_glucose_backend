@@ -435,33 +435,57 @@ bool sendPredictRequest(int &httpCode, String &responseBody) {
   client.println("Connection: close");
   client.println();
 
-  // ── Stream body — never holds more than a few bytes at a time ──
-  char buf[24];
-  int  n;
+  // ── Stream body via a small flush buffer ────────────────────────
+  // One client.write() call per float (~12000 calls total) was
+  // extremely slow: each call over WiFiClientSecure wraps that tiny
+  // chunk in its own encrypted TLS record, and per-call overhead at
+  // that volume added *minutes* of latency even though the raw bytes
+  // are tiny. Batching many numbers into a ~1KB buffer before each
+  // write cuts ~12000 writes down to ~150, without going back to
+  // holding the whole ~150KB body in RAM at once.
+  char   sendBuf[1024];
+  size_t sendPos = 0;
+  char   numBuf[24];
+  int    numLen;
 
-  n = snprintf(buf, sizeof(buf), "{\"age\":%.1f,\"ir\":[", PATIENT_AGE);
-  client.write((const uint8_t*)buf, n);
+  #define FLUSH_SEND() do { \
+    if (sendPos > 0) { client.write((const uint8_t*)sendBuf, sendPos); sendPos = 0; } \
+  } while (0)
+
+  #define APPEND_SEND(s, len) do { \
+    if (sendPos + (size_t)(len) > sizeof(sendBuf)) FLUSH_SEND(); \
+    memcpy(sendBuf + sendPos, (s), (len)); \
+    sendPos += (len); \
+  } while (0)
+
+  numLen = snprintf(numBuf, sizeof(numBuf), "{\"age\":%.1f,\"ir\":[", PATIENT_AGE);
+  APPEND_SEND(numBuf, numLen);
 
   for (int i = 0; i < TOTAL_SAMPLES; i++) {
-    n = snprintf(buf, sizeof(buf), i < TOTAL_SAMPLES - 1 ? "%.4f," : "%.4f", irBuffer[i]);
-    client.write((const uint8_t*)buf, n);
+    numLen = snprintf(numBuf, sizeof(numBuf), i < TOTAL_SAMPLES - 1 ? "%.4f," : "%.4f", irBuffer[i]);
+    APPEND_SEND(numBuf, numLen);
     if (i % 500 == 0) {
       yield();
       Serial.printf("Streaming IR: %d/%d\n", i, TOTAL_SAMPLES);
     }
   }
 
-  n = snprintf(buf, sizeof(buf), "],\"red\":[");
-  client.write((const uint8_t*)buf, n);
+  numLen = snprintf(numBuf, sizeof(numBuf), "],\"red\":[");
+  APPEND_SEND(numBuf, numLen);
 
   for (int i = 0; i < TOTAL_SAMPLES; i++) {
-    n = snprintf(buf, sizeof(buf), i < TOTAL_SAMPLES - 1 ? "%.4f," : "%.4f", redBuffer[i]);
-    client.write((const uint8_t*)buf, n);
+    numLen = snprintf(numBuf, sizeof(numBuf), i < TOTAL_SAMPLES - 1 ? "%.4f," : "%.4f", redBuffer[i]);
+    APPEND_SEND(numBuf, numLen);
     if (i % 500 == 0) yield();
   }
 
-  n = snprintf(buf, sizeof(buf), "]}");
-  client.write((const uint8_t*)buf, n);
+  numLen = snprintf(numBuf, sizeof(numBuf), "]}");
+  APPEND_SEND(numBuf, numLen);
+
+  FLUSH_SEND();
+
+  #undef FLUSH_SEND
+  #undef APPEND_SEND
 
   Serial.println("Body sent, waiting for response...");
 
