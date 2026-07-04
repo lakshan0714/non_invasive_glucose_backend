@@ -26,10 +26,10 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <Adafruit_SSD1306.h>
 #include <Adafruit_GFX.h>
-#include <esp_heap_caps.h>
 
 // ── WiFi credentials ──────────────────────────────────────────────
 const char* WIFI_SSID     = "chiki chiki";       // ← change
@@ -38,6 +38,14 @@ const char* WIFI_PASSWORD = "thuwa567891011";   // ← change
 // ── API endpoints ─────────────────────────────────────────────────
 const char* API_URL    = "https://non-invasive-glucose-backend.onrender.com/predict";
 const char* HEALTH_URL = "https://non-invasive-glucose-backend.onrender.com/health";
+
+// Used by the raw streaming POST in sendPredictRequest() — avoids
+// buffering the whole ~150KB JSON body in one contiguous allocation,
+// which heap fragmentation causes to fail even with plenty of nominal
+// free heap on plain (non-PSRAM) ESP32 boards.
+const char*    API_HOST = "non-invasive-glucose-backend.onrender.com";
+const char*    API_PATH = "/predict";
+const uint16_t API_PORT = 443;
 
 // ── Patient config ────────────────────────────────────────────────
 const float PATIENT_AGE = 25.0;   // ← update per patient
@@ -93,11 +101,6 @@ int   smoothIndex = 0;
 float* irBuffer  = nullptr;
 float* redBuffer = nullptr;
 int    sampleCount = 0;
-
-// ── JSON payload buffer (built once at boot, reused every send) ──
-// Worst case per float: "-262143.1234," = 14 bytes. 2 arrays * TOTAL_SAMPLES.
-const size_t PAYLOAD_BUF_SIZE = (size_t)TOTAL_SAMPLES * 2 * 14 + 256;
-char*  payloadBuf = nullptr;
 
 // ── State machine ─────────────────────────────────────────────────
 enum State {
@@ -383,6 +386,120 @@ bool wakeUpServer() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+//  STREAMING PREDICT REQUEST
+//
+//  The JSON body for /predict is ~150KB (2 * TOTAL_SAMPLES floats).
+//  Building it as one String/buffer needs one large contiguous heap
+//  block, which fails on plain (non-PSRAM) ESP32 boards once WiFi/TLS
+//  have fragmented the heap — even with plenty of nominal free heap.
+//  Instead, this computes the exact Content-Length with a cheap
+//  "dry run" (snprintf with a throwaway buffer just to get the length),
+//  then streams the body straight to the TLS socket a few bytes at a
+//  time, so peak extra RAM use is a handful of bytes, not 150KB.
+// ═══════════════════════════════════════════════════════════════════
+
+size_t irRedJsonLength() {
+  char tmp[24];
+  size_t total = 0;
+  total += snprintf(tmp, sizeof(tmp), "{\"age\":%.1f,\"ir\":[", PATIENT_AGE);
+  for (int i = 0; i < TOTAL_SAMPLES; i++) {
+    total += snprintf(tmp, sizeof(tmp), i < TOTAL_SAMPLES - 1 ? "%.4f," : "%.4f", irBuffer[i]);
+  }
+  total += snprintf(tmp, sizeof(tmp), "],\"red\":[");
+  for (int i = 0; i < TOTAL_SAMPLES; i++) {
+    total += snprintf(tmp, sizeof(tmp), i < TOTAL_SAMPLES - 1 ? "%.4f," : "%.4f", redBuffer[i]);
+  }
+  total += snprintf(tmp, sizeof(tmp), "]}");
+  return total;
+}
+
+bool sendPredictRequest(int &httpCode, String &responseBody) {
+  WiFiClientSecure client;
+  client.setInsecure();          // no cert pinning, same as HTTPClient's default https behavior
+  client.setTimeout(30);
+
+  Serial.printf("Free heap before send: %u bytes\n", ESP.getFreeHeap());
+  Serial.println("Connecting to API host...");
+  if (!client.connect(API_HOST, API_PORT)) {
+    Serial.println("Connection to API host failed!");
+    return false;
+  }
+
+  size_t contentLength = irRedJsonLength();
+  Serial.printf("Computed Content-Length: %u bytes\n", (unsigned)contentLength);
+
+  client.printf("POST %s HTTP/1.1\r\n", API_PATH);
+  client.printf("Host: %s\r\n", API_HOST);
+  client.println("Content-Type: application/json");
+  client.printf("Content-Length: %u\r\n", (unsigned)contentLength);
+  client.println("Connection: close");
+  client.println();
+
+  // ── Stream body — never holds more than a few bytes at a time ──
+  char buf[24];
+  int  n;
+
+  n = snprintf(buf, sizeof(buf), "{\"age\":%.1f,\"ir\":[", PATIENT_AGE);
+  client.write((const uint8_t*)buf, n);
+
+  for (int i = 0; i < TOTAL_SAMPLES; i++) {
+    n = snprintf(buf, sizeof(buf), i < TOTAL_SAMPLES - 1 ? "%.4f," : "%.4f", irBuffer[i]);
+    client.write((const uint8_t*)buf, n);
+    if (i % 500 == 0) {
+      yield();
+      Serial.printf("Streaming IR: %d/%d\n", i, TOTAL_SAMPLES);
+    }
+  }
+
+  n = snprintf(buf, sizeof(buf), "],\"red\":[");
+  client.write((const uint8_t*)buf, n);
+
+  for (int i = 0; i < TOTAL_SAMPLES; i++) {
+    n = snprintf(buf, sizeof(buf), i < TOTAL_SAMPLES - 1 ? "%.4f," : "%.4f", redBuffer[i]);
+    client.write((const uint8_t*)buf, n);
+    if (i % 500 == 0) yield();
+  }
+
+  n = snprintf(buf, sizeof(buf), "]}");
+  client.write((const uint8_t*)buf, n);
+
+  Serial.println("Body sent, waiting for response...");
+
+  // ── Wait for response ────────────────────────────────────────────
+  unsigned long deadline = millis() + 60000UL;
+  while (client.connected() && !client.available()) {
+    if (millis() > deadline) {
+      Serial.println("Timed out waiting for response");
+      client.stop();
+      return false;
+    }
+    delay(10);
+  }
+
+  String statusLine = client.readStringUntil('\n');
+  Serial.println("Status line: " + statusLine);
+  int sp1  = statusLine.indexOf(' ');
+  httpCode = (sp1 >= 0) ? statusLine.substring(sp1 + 1, sp1 + 4).toInt() : 0;
+
+  // Skip response headers up to the blank line
+  while (client.connected() || client.available()) {
+    String line = client.readStringUntil('\n');
+    if (line.length() <= 1) break;   // bare "\r" == end of headers
+  }
+
+  // Read response body
+  responseBody = "";
+  while (client.connected() || client.available()) {
+    while (client.available()) {
+      responseBody += (char)client.read();
+    }
+  }
+  client.stop();
+
+  return true;
+}
+
+// ═══════════════════════════════════════════════════════════════════
 //  SETUP
 // ═══════════════════════════════════════════════════════════════════
 
@@ -429,30 +546,6 @@ void setup() {
     showError("Memory error!\nRestart device");
     while (true);
   }
-
-  // Allocate JSON payload buffer ONCE, here, while heap is least
-  // fragmented. Prefer PSRAM if the board has it; fall back to
-  // internal heap otherwise. Building this buffer with repeated
-  // Arduino String concatenation instead (as before) caused heap
-  // fragmentation/OOM mid-request, which silently emptied the String
-  // and sent an empty POST body (server saw 422 "Field required").
-  Serial.printf("Free heap before payload buffer alloc: %u bytes\n", ESP.getFreeHeap());
-  Serial.printf("Requesting payload buffer: %u bytes\n", (unsigned)PAYLOAD_BUF_SIZE);
-
-  payloadBuf = (char*) heap_caps_malloc(PAYLOAD_BUF_SIZE, MALLOC_CAP_SPIRAM);
-  if (payloadBuf) {
-    Serial.println("Payload buffer allocated in PSRAM");
-  } else {
-    payloadBuf = (char*) malloc(PAYLOAD_BUF_SIZE);
-    if (payloadBuf) Serial.println("Payload buffer allocated in internal heap");
-  }
-
-  if (!payloadBuf) {
-    Serial.println("Payload buffer allocation failed!");
-    showError("Memory error!\nRestart device");
-    while (true);
-  }
-  Serial.printf("Free heap after payload buffer alloc: %u bytes\n", ESP.getFreeHeap());
 
   // Init smoothing arrays
   for (int i = 0; i < SMOOTH_SIZE; i++) {
@@ -612,64 +705,13 @@ void loop() {
       connectWiFi();
     }
 
-    HTTPClient http;
-    http.begin(API_URL);
-    http.addHeader("Content-Type", "application/json");
-    http.setTimeout(120000);   // 2 min timeout
+    // ── POST request — streamed directly to the socket ──────────
+    int    httpCode = 0;
+    String response;
+    bool   sent = sendPredictRequest(httpCode, response);
+    Serial.printf("HTTP code: %d (sent=%d)\n", httpCode, sent);
 
-    // ── Build JSON into the pre-allocated buffer ─────────────────
-    // Writing directly into one fixed buffer (instead of growing an
-    // Arduino String via repeated +=) avoids the heap fragmentation/OOM
-    // that was silently truncating the payload to empty.
-    Serial.printf("Free heap before JSON build: %u bytes\n", ESP.getFreeHeap());
-
-    size_t pos = 0;
-    size_t cap = PAYLOAD_BUF_SIZE;
-    bool   overflow = false;
-
-    #define APPEND(...) do { \
-      int _n = snprintf(payloadBuf + pos, cap - pos, __VA_ARGS__); \
-      if (_n < 0 || (size_t)_n >= cap - pos) { overflow = true; } \
-      else { pos += (size_t)_n; } \
-    } while (0)
-
-    APPEND("{\"age\":%.1f,\"ir\":[", PATIENT_AGE);
-
-    for (int i = 0; i < TOTAL_SAMPLES && !overflow; i++) {
-      APPEND(i < TOTAL_SAMPLES - 1 ? "%.4f," : "%.4f", irBuffer[i]);
-      if (i % 500 == 0) {
-        yield();
-        Serial.printf("Building JSON IR: %d/%d\n", i, TOTAL_SAMPLES);
-      }
-    }
-    if (!overflow) APPEND("],\"red\":[");
-
-    for (int i = 0; i < TOTAL_SAMPLES && !overflow; i++) {
-      APPEND(i < TOTAL_SAMPLES - 1 ? "%.4f," : "%.4f", redBuffer[i]);
-      if (i % 500 == 0) yield();
-    }
-    if (!overflow) APPEND("]}");
-
-    #undef APPEND
-
-    if (overflow) {
-      Serial.println("Payload buffer overflow — aborting send!");
-      showError("Payload too\nlarge, restart");
-      delay(5000);
-      showIdle();
-      currentState = STATE_IDLE;
-      return;
-    }
-
-    Serial.printf("Payload size: %u bytes\n", (unsigned)pos);
-    Serial.printf("Free heap after JSON build: %u bytes\n", ESP.getFreeHeap());
-
-    // ── POST request ────────────────────────────────────────────
-    int httpCode = http.POST((uint8_t*)payloadBuf, pos);
-    Serial.printf("HTTP code: %d\n", httpCode);
-
-    if (httpCode == 200) {
-      String response = http.getString();
+    if (sent && httpCode == 200) {
       Serial.println("Response: " + response);
 
       DynamicJsonDocument doc(1024);
@@ -683,7 +725,6 @@ void loop() {
         Serial.printf("Glucose: %.2f mg/dL | Zone: %s | Segs: %d\n",
                       glucose, zone.c_str(), nSegs);
 
-        http.end();
         showResult(glucose, zone);
 
         // Hold result for 15 seconds
@@ -699,7 +740,6 @@ void loop() {
           msg = doc["message"].as<String>();
         }
         Serial.println("API error: " + msg);
-        http.end();
         showError(msg.substring(0, 40));
         delay(5000);
         showIdle();
@@ -707,9 +747,8 @@ void loop() {
       }
 
     } else {
-      Serial.printf("HTTP error: %d\n", httpCode);
-      http.end();
-      showError("HTTP Err: " + String(httpCode));
+      Serial.printf("HTTP error: %d (sent=%d)\n", httpCode, sent);
+      showError(sent ? ("HTTP Err: " + String(httpCode)) : "Connection\nfailed");
       delay(5000);
       showIdle();
       currentState = STATE_IDLE;
