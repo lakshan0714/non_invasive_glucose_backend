@@ -78,7 +78,6 @@ class PPGRequest(BaseModel):
 class PPGResponse(BaseModel):
     status            : str
     glucose           : Optional[float]       = None
-    zone              : Optional[str]         = None
     std               : Optional[float]       = None
     n_segments_used   : Optional[int]         = None
     seg_predictions   : Optional[List[float]] = None

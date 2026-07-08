@@ -32,13 +32,6 @@ def _load_model():
     return _model_pkg, _full_names
 
 
-def clarke_zone(pred: float) -> str:
-    if pred < 70:    return "Low (Hypoglycemic)"
-    elif pred < 100: return "Normal"
-    elif pred < 126: return "Pre-diabetic"
-    else:            return "Diabetic"
-
-
 def run_pipeline(ir_raw, red_raw, age=0.0, hr=0.0, fs=100) -> dict:
 
     pkg, full_names = _load_model()
@@ -147,17 +140,15 @@ def run_pipeline(ir_raw, red_raw, age=0.0, hr=0.0, fs=100) -> dict:
     seg_preds = model.predict(X_sc).tolist()
     glucose   = float(np.mean(seg_preds))
     std       = float(np.std(seg_preds))
-    zone      = clarke_zone(glucose)
 
     logger.info(f"Prediction: glucose={glucose:.2f} "
-                f"zone={zone} std={std:.2f} "
+                f"std={std:.2f} "
                 f"segments={len(seg_preds)} "
                 f"preds={[round(p,2) for p in seg_preds]}")
 
     return {
         "status"           : "success",
         "glucose"          : round(glucose, 2),
-        "zone"             : zone,
         "std"              : round(std, 2),
         "n_segments_used"  : len(seg_preds),
         "seg_predictions"  : [round(p, 2) for p in seg_preds],
