@@ -32,8 +32,8 @@
 #include <Adafruit_GFX.h>
 
 // ── WiFi credentials ──────────────────────────────────────────────
-const char* WIFI_SSID     = "chiki chiki";       // ← change
-const char* WIFI_PASSWORD = "thuwa567891011";   // ← change
+const char* WIFI_SSID     = "FOE_Students";       // ← change
+const char* WIFI_PASSWORD = "FOE@30st";   // ← change
 
 // ── API endpoints ─────────────────────────────────────────────────
 const char* API_URL    = "https://non-invasive-glucose-backend.onrender.com/predict";
@@ -101,6 +101,28 @@ int   smoothIndex = 0;
 float* irBuffer  = nullptr;
 float* redBuffer = nullptr;
 int    sampleCount = 0;
+
+// ── Heart-rate detection (real-time beat counter) ──────────────────
+// MAX30102 has no on-chip HR computation — this is a causal, on-device
+// stand-in for the offline find_peaks(distance=0.4*fs, prominence=5%)
+// beat detector the server uses, so meta_hr_avg can be estimated live
+// during the same 60s acquisition instead of requiring a second pass.
+// Intervals are measured in sample counts (fixed ~100Hz sensor clock)
+// rather than millis(), since the ESP32 polls the FIFO in bursts and
+// wall-clock timing between individual samples isn't reliable.
+#define HR_MIN_BPM              40
+#define HR_MAX_BPM              180
+#define HR_MIN_INTERVAL_SAMPLES (SAMPLE_RATE * 60 / HR_MAX_BPM)   // refractory period
+#define HR_MAX_INTERVAL_SAMPLES (SAMPLE_RATE * 60 / HR_MIN_BPM)   // stale-interval cutoff
+#define HR_ENVELOPE_DECAY       0.98f
+
+float hrPeakEnv        = 0;
+float hrValleyEnv      = 0;
+bool  hrArmed          = true;
+int   hrLastBeatSample = -1;
+float hrSum            = 0;
+int   hrCount          = 0;
+float lastHRAvg        = 0;
 
 // ── State machine ─────────────────────────────────────────────────
 enum State {
@@ -187,6 +209,53 @@ float smoothSignal(float* arr, float newVal) {
   return sum / SMOOTH_SIZE;
 }
 
+void resetHRState() {
+  hrPeakEnv        = 0;
+  hrValleyEnv      = 0;
+  hrArmed          = true;
+  hrLastBeatSample = -1;
+  hrSum            = 0;
+  hrCount          = 0;
+}
+
+// Adaptive-threshold beat detector, called once per acquired sample with
+// the smoothed AC IR value. Peak/valley envelopes track the signal with
+// fast attack / slow decay; a beat fires when the signal crosses the
+// midpoint threshold while armed, then re-arms once it falls back below
+// a hysteresis band. Each valid inter-beat interval yields one BPM sample.
+void updateHR(float irSm, int sampleIdx) {
+  if (hrPeakEnv == 0 || irSm > hrPeakEnv) hrPeakEnv = irSm;
+  else hrPeakEnv = hrPeakEnv * HR_ENVELOPE_DECAY + irSm * (1 - HR_ENVELOPE_DECAY);
+
+  if (hrValleyEnv == 0 || irSm < hrValleyEnv) hrValleyEnv = irSm;
+  else hrValleyEnv = hrValleyEnv * HR_ENVELOPE_DECAY + irSm * (1 - HR_ENVELOPE_DECAY);
+
+  float range     = hrPeakEnv - hrValleyEnv;
+  float threshold = hrValleyEnv + 0.5f * range;
+
+  if (hrArmed && irSm >= threshold &&
+      (hrLastBeatSample < 0 || (sampleIdx - hrLastBeatSample) >= HR_MIN_INTERVAL_SAMPLES)) {
+    if (hrLastBeatSample >= 0) {
+      int interval = sampleIdx - hrLastBeatSample;
+      if (interval <= HR_MAX_INTERVAL_SAMPLES) {
+        float bpm = 60.0f * SAMPLE_RATE / (float)interval;
+        if (bpm >= HR_MIN_BPM && bpm <= HR_MAX_BPM) {
+          hrSum += bpm;
+          hrCount++;
+        }
+      }
+    }
+    hrLastBeatSample = sampleIdx;
+    hrArmed = false;
+  } else if (irSm <= threshold - 0.1f * range) {
+    hrArmed = true;
+  }
+}
+
+float getHRAverage() {
+  return hrCount > 0 ? (hrSum / hrCount) : 0.0f;
+}
+
 void resetSignalState() {
   irDC = 0; redDC = 0;
   smoothIndex = 0;
@@ -195,6 +264,7 @@ void resetSignalState() {
     redSmooth[i] = 0;
   }
   clearFIFO();
+  resetHRState();
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -399,9 +469,9 @@ bool wakeUpServer() {
 // ═══════════════════════════════════════════════════════════════════
 
 size_t irRedJsonLength() {
-  char tmp[24];
+  char tmp[48];
   size_t total = 0;
-  total += snprintf(tmp, sizeof(tmp), "{\"age\":%.1f,\"ir\":[", PATIENT_AGE);
+  total += snprintf(tmp, sizeof(tmp), "{\"age\":%.1f,\"hr\":%.1f,\"ir\":[", PATIENT_AGE, lastHRAvg);
   for (int i = 0; i < TOTAL_SAMPLES; i++) {
     total += snprintf(tmp, sizeof(tmp), i < TOTAL_SAMPLES - 1 ? "%.4f," : "%.4f", irBuffer[i]);
   }
@@ -445,7 +515,7 @@ bool sendPredictRequest(int &httpCode, String &responseBody) {
   // holding the whole ~150KB body in RAM at once.
   char   sendBuf[1024];
   size_t sendPos = 0;
-  char   numBuf[24];
+  char   numBuf[48];
   int    numLen;
 
   #define FLUSH_SEND() do { \
@@ -458,7 +528,7 @@ bool sendPredictRequest(int &httpCode, String &responseBody) {
     sendPos += (len); \
   } while (0)
 
-  numLen = snprintf(numBuf, sizeof(numBuf), "{\"age\":%.1f,\"ir\":[", PATIENT_AGE);
+  numLen = snprintf(numBuf, sizeof(numBuf), "{\"age\":%.1f,\"hr\":%.1f,\"ir\":[", PATIENT_AGE, lastHRAvg);
   APPEND_SEND(numBuf, numLen);
 
   for (int i = 0; i < TOTAL_SAMPLES; i++) {
@@ -749,6 +819,9 @@ void loop() {
         float redSm = smoothSignal(redSmooth, redAC);
         smoothIndex++;
 
+        // Real-time heart-rate beat detection
+        updateHR(irSm, sampleCount);
+
         // Store
         irBuffer[sampleCount]  = irSm;
         redBuffer[sampleCount] = redSm;
@@ -758,7 +831,9 @@ void loop() {
       yield();   // prevent watchdog reset
     }
 
+    lastHRAvg = getHRAverage();
     Serial.printf("Collection complete: %d samples\n", sampleCount);
+    Serial.printf("HR average: %.1f bpm (from %d valid beats)\n", lastHRAvg, hrCount);
     currentState = STATE_SEND;
     return;
   }

@@ -39,7 +39,7 @@ def clarke_zone(pred: float) -> str:
     else:            return "Diabetic"
 
 
-def run_pipeline(ir_raw, red_raw, age=0.0, fs=100) -> dict:
+def run_pipeline(ir_raw, red_raw, age=0.0, hr=0.0, fs=100) -> dict:
 
     pkg, full_names = _load_model()
     model      = pkg["model"]
@@ -50,7 +50,7 @@ def run_pipeline(ir_raw, red_raw, age=0.0, fs=100) -> dict:
     red = np.array(red_raw, dtype=np.float64)
 
     logger.info(f"Signal received — IR:{len(ir)} "
-                f"Red:{len(red)} duration:{len(ir)/fs:.1f}s")
+                f"Red:{len(red)} duration:{len(ir)/fs:.1f}s hr:{hr}")
 
     if len(ir) < fs * 10:
         logger.warning(f"Signal too short: {len(ir)} samples")
@@ -108,7 +108,7 @@ def run_pipeline(ir_raw, red_raw, age=0.0, fs=100) -> dict:
         feat.update(extract_group_C(seg, "red", fs))
         feat.update(extract_group_D(seg, "ir",  fs))
         feat.update(extract_group_D(seg, "red", fs))
-        feat["meta_hr_avg"] = 0.0
+        feat["meta_hr_avg"] = hr
         feat["meta_age"]    = age
         feat["meta_height"] = 0.0
         feat["meta_weight"] = 0.0

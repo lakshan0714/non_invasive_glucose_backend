@@ -72,6 +72,8 @@ class PPGRequest(BaseModel):
             description="Red channel samples")
     age : Optional[float] = Field(0.0,
             description="Patient age (optional)")
+    hr  : Optional[float] = Field(0.0,
+            description="Average heart rate in bpm, computed on-device (optional)")
 
 class PPGResponse(BaseModel):
     status            : str
@@ -123,7 +125,7 @@ def info():
 @app.post("/predict", response_model=PPGResponse)
 def predict(req: PPGRequest):
     logger.info(f"Predict called — IR:{len(req.ir)} "
-                f"Red:{len(req.red)} age:{req.age}")
+                f"Red:{len(req.red)} age:{req.age} hr:{req.hr}")
 
     # ── Validate ──────────────────────────────────────────────────
     if len(req.ir) < 1000:
@@ -149,6 +151,7 @@ def predict(req: PPGRequest):
             ir_raw = req.ir,
             red_raw= req.red,
             age    = req.age or 0.0,
+            hr     = req.hr or 0.0,
         )
         elapsed = time.time() - t0
         logger.info(f"Pipeline done in {elapsed:.2f}s — "
